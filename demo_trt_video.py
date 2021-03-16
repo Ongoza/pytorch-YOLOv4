@@ -232,6 +232,8 @@ def allocate_buffers(engine, batch_size):
 def do_inference(context, bindings, inputs, outputs, stream):
     # Transfer input data to the GPU.
     #cuda.memcpy_htod_async(d_input, h_input, stream)
+    print("inputs",inputs[0])
+    print("device",inputs[0].device)
     [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
     context.execute_async(bindings=bindings, stream_handle=stream.handle)
     #cuda.memcpy_dtoh_async(h_output, d_output, stream)
@@ -248,15 +250,15 @@ def get_engine(engine_path):
     with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as runtime:
         return runtime.deserialize_cuda_engine(f.read())
 
-TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
-class GpuDevice(object):
+#TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+class GpuDevice(threading.Thread):
     def __init__(self):
-      #threading.Thread.__init__(self)
+      threading.Thread.__init__(self)
+      #self.condition = condition
       self.skip_counter = 0
       #TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
       #trt.init_libnvinfer_plugins(TRT_LOGGER, '')
       #self.trt_runtime = trt.Runtime(TRT_LOGGER)
-      self.TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
       self.counter = 0
       self.cap = cv2.VideoCapture('39.avi')
       self.img_size = 416
@@ -265,15 +267,41 @@ class GpuDevice(object):
       self.engine_path = 'yolov4_-1_3_'+str(self.img_size)+'_'+str(self.img_size)+'_dynamic.engine' # TRT inference time: 0.021343
       #self.trt_runtime = trt.Runtime(self.TRT_LOGGER)
       self.engine = None
-      with open(self.engine_path, "rb") as f, trt.Runtime(self.TRT_LOGGER) as runtime:
-        self.engine = runtime.deserialize_cuda_engine(f.read())
-            # Allocate buffers
-        #print('Allocating Buffers')
-      self.inputs, self.outputs, self.bindings, self.stream = allocate_buffers(self.engine, self.max_batch_size)
-      #print("1--",self.bindings,self.stream.handle)
-      with self.engine.create_execution_context() as context:
-        context.set_binding_shape(0, (self.max_batch_size, 3, self.img_size, self.img_size))
-        while True:
+      self.running = False
+      #self.start()
+
+    def run(self):
+      cuda.init()
+      dev = cuda.Device(0)
+      ctx = dev.make_context()
+      self.TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+      self.trt_runtime = trt.Runtime(self.TRT_LOGGER)
+      with open(self.engine_path, "rb") as f:
+        self.engine = self.trt_runtime.deserialize_cuda_engine(f.read())
+      self.context = self.engine.create_execution_context()
+      self.context.set_binding_shape(0, (self.max_batch_size, 3, self.img_size, self.img_size))
+      self.inputs = []
+      self.outputs = []
+      self.bindings = []
+      self.stream = cuda.Stream()
+      for binding in self.engine:
+            size = trt.volume(self.engine.get_binding_shape(binding)) * self.max_batch_size
+            dims = self.engine.get_binding_shape(binding)        
+            if dims[0] < 0: size *= -1        
+            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
+            # Allocate host and device buffers
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            # Append the device buffer to device bindings.
+            self.bindings.append(int(device_mem))
+            # Append to the appropriate list.
+            if self.engine.binding_is_input(binding): 
+              self.inputs.append(HostDeviceMem(host_mem, device_mem))
+            else: 
+              self.outputs.append(HostDeviceMem(host_mem, device_mem))
+      if True:
+        self.running = True
+        while self.running:
           r, frame = self.cap.read()
           if (not r):
               print("skip frame ", self.skip_counter)
@@ -294,21 +322,28 @@ class GpuDevice(object):
           self.inputs[0].host = frames
           #print("inputs",len(self.inputs[0].host))
           #print("outputs",len(self.outputs))
-          trt_outputs = do_inference_new(context, bindings=self.bindings, inputs=self.inputs, outputs=self.outputs, stream=self.stream, batch_size=cur_batch_size)
+          trt_outputs = do_inference_new(self.context, bindings=self.bindings, inputs=self.inputs, outputs=self.outputs, stream=self.stream, batch_size=cur_batch_size)
           trt_outputs[0] = trt_outputs[0].reshape(cur_batch_size, -1, 1, 4)
           trt_outputs[1] = trt_outputs[1].reshape(cur_batch_size, -1, 80)
           # Output inference time
           #print("TensorRT inference time: {} ms".format(int(round((time.time() - inference_start_time) * 1000))))
           boxes = post_processing(0, 0.4, 0.6, trt_outputs)
           print(self.counter, time.time()-start, "boxes",  len(boxes[0]))
-          if self.counter > 10:
+          if self.counter > 13:
             break
       self.cap.release()
+      del self.engine
+      ctx.pop()
+      del ctx
       print("Finished OK")
       # self.kill()
 
 def do_inference_new(context, bindings, inputs, outputs, stream, batch_size=1):
     # Transfer input data to the GPU.
+    # print("context",context)
+    # print("inputs",inputs[0])
+    # print("device",inputs[0].device)
+
     [cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
     # Run inference.
     context.execute_async(batch_size=batch_size, bindings=bindings, stream_handle=stream.handle)
@@ -414,8 +449,8 @@ def main():
         break
   print("end")
 
-  if context:
-      context.pop()
+  # if context:
+  #     context.pop()
   del context
   if cap:
     cap.release()
@@ -609,8 +644,16 @@ def detect2(context, inputs, outputs, bindings, stream, images, size=1):
 
 #TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 #main()
+#condition = threading.Condition()
+#cuda.init()
+#some_array = np.ones((1,512), dtype=np.float32)
+#num = cuda.Device.count()
+#print("num", num)
 gpu = 0
 gpu = GpuDevice()
+print("start")
+gpu.start()
+
 time.sleep(10)
 print("stop by time")
 # if gpu:
